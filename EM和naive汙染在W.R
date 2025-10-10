@@ -38,7 +38,7 @@ make_cut_vec <- function(p, n_main, contam_n) {
     GSDFBETA = 9 * k / (n_main - contam_n - 3*p),
     mCDstar  = 3 / sqrt((n_main - p) / (n_main - contam_n)),
     GCD_GSPR = 1,
-    StdR2_CS = 3, StdR2_MF = 3, StdR2_NK = 3,
+    StdR2_CS = 5, StdR2_MF = 5, StdR2_NK = 5,
     GD = 4 / (n_main - p), MD = 4 / (n_main - p)
   )
 }
@@ -201,7 +201,7 @@ run_EM_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec,
   ## --- 多輪小步修剪 ---
   .z <- function(x) { m <- stats::median(x, na.rm=TRUE); s <- stats::mad(x, center=m, constant=1.4826, na.rm=TRUE); if (!is.finite(s) || s<=0) return(rep(0,length(x))); (x-m)/s }
   keep <- seq_len(n_main); dropped <- integer(0)
-  trim_budget_frac <- 0.05; trim_budget <- max(1L, floor(trim_budget_frac * n_main))
+  trim_budget_frac <- 0.05; trim_budget <- floor(trim_budget_frac * n_main)
   max_round <- 2
   em_curr <- em_out
   
@@ -231,8 +231,7 @@ run_EM_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec,
     
     remain <- trim_budget - length(dropped)
     if (remain <= 0L) break
-    drop_frac_iter <- 0.5
-    drop_n <- min(remain, max(0L, ceiling(drop_frac_iter * length(cand_local))))
+    drop_n <- min(remain, max(0L, floor(0.5 * length(cand_local))))
     if (drop_n <= 0L) break
     
     cand_global <- idx_keep[cand_local]
@@ -274,21 +273,25 @@ run_EM_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec,
   }
   em_out <- em_curr
   
+  # 1) 映射到 keep 的座標 + 新 n
+  n_main_post <- length(keep)
+  contam_idx_post <- match(intersect(contam_idx, keep), keep)
+  
+  # 2) 用新 n / 新 contam_n 重算 cut（關鍵）
+  cut_vec_post <- make_cut_vec(p = p, n_main = n_main_post, contam_n = length(contam_idx_post))
+  
   # === 修剪結束後：用最終 keep + 最終 em_out 重算一次診斷 ===
   infl <- em_diag_func(
     Y = main_dat$Y[keep],
     W = as.matrix(main_dat[keep, paste0("W", 1:p), drop = FALSE]),
     sigma2_mat = delta2_main[keep, , drop = FALSE],
-    cut_vec = cut_vec,
-    G.ind = match(intersect(G.ind, keep), keep),  # 把原本的好點映射到新索引
+    cut_vec = cut_vec_post,
+    G.ind = match(intersect(G.ind, keep), keep),
     em_out = em_out,
     dbg = FALSE
   )
-  
-  # 用修剪後的 n 與汙染索引做後續 CIR/SR/AUC
-  n_main <- length(keep)
-  contam_idx <- match(intersect(contam_idx, keep), keep)  # 把舊 contam_idx 映射到新 keep 的座標
-  
+  n_main    <- n_main_post
+  contam_idx <- contam_idx_post
   
   ## 只取斜率並做效能統計
   nm <- colnames(Wmat)
@@ -336,19 +339,37 @@ run_EM_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec,
   diag_df$estimator <- "TrimEM"
   diag_df$AUC <- as.numeric(auc_by_method[match(diag_df$method, names(auc_by_method))])
   
-  list(perf = perf_df, diag = diag_df, infl = infl, Q_trace = em_out$Q_trace)
+  list(perf = perf_df, diag = diag_df, infl = infl, Q_trace = em_out$Q_trace, keep = keep)
 }
 
 ## ========== 用同一份資料跑 naive ==========
-run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec) {
+run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec, idx_use = NULL) {
+  
+  # 先從 shared 解包（一定要先做，下面才有 main_dat / contam_idx 可用）
   main_dat    <- shared$main_dat
   contam_idx  <- shared$contam_idx
   n_main      <- shared$n_main
+  
+  # 若指定子集（例如 EM 修剪後的 keep），再子集並用新 n 重算 cut
+  if (!is.null(idx_use)) {
+    main_dat <- main_dat[idx_use, , drop = FALSE]
+    n_main   <- nrow(main_dat)
+    
+    # 把舊 contam 索引映射到子集座標
+    contam_map <- match(contam_idx, idx_use)
+    contam_idx <- contam_map[!is.na(contam_map)]
+    
+    # 用新 n / 新 contam_n 重算 cut
+    cut_vec <- make_cut_vec(p = p, n_main = n_main, contam_n = length(contam_idx))
+  }
+  
+  # 基本檢查（在子集之後）
   if (length(unique(main_dat$Y)) < 2L) return(NULL)
   p1 <- mean(main_dat$Y[setdiff(seq_len(n_main), contam_idx)] == 1)
   if (p1 <= 0.1 || p1 >= 0.9) return(NULL)
   
-  infl <- diag_all_naive( 
+  # 診斷（naive，不校正測誤）
+  infl <- diag_all_naive(
     Y = main_dat$Y,
     W = as.matrix(main_dat[, paste0("W", 1:p)]),
     G.ind = setdiff(seq_len(n_main), contam_idx),
@@ -356,6 +377,7 @@ run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec) {
     dbg = FALSE
   )
   
+  # 配適一個 naive GLM 以做偏誤/MSE（保持你原本流程）
   keep <- seq_len(n_main)
   glm2 <- try(glm(Y ~ ., family = binomial(),
                   data = main_dat[keep, c("Y", paste0("W", 1:p))],
@@ -366,6 +388,7 @@ run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec) {
                                 family = binomial("logit"), type = "AS_mixed"), silent = TRUE)
     }
   }
+  
   nm <- paste0("W", 1:p)
   b <- tryCatch(coef(glm2), error = function(e) NULL)
   if (is.null(b) || any(!is.finite(b)) || max(abs(b)) > 25) {
@@ -374,6 +397,7 @@ run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec) {
     slope_names <- setdiff(names(b), "(Intercept)")
     beta_naive <- as.numeric(b[slope_names][match(nm, slope_names)])
   }
+  
   get_bias_mse <- function(est, beta_true) {
     d <- est - beta_true
     safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
@@ -384,6 +408,7 @@ run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec) {
   perf_df$init_type <- "NAIVE"
   perf_df$estimator <- "NaiveGLM"
   
+  # CIR/SR/AUC（保持你原本的寫法，R 系列用 raw 分數做 AUC）
   if (!identical(infl$id, seq_len(n_main))) infl <- infl[order(infl$id), , drop = FALSE]
   flag_mat <- as.matrix(infl[, grepl("^flag_", names(infl)), drop = FALSE]); flag_mat[is.na(flag_mat)] <- FALSE
   is_bad <- seq_len(n_main) %in% contam_idx
@@ -415,9 +440,9 @@ run_naive_from_shared <- function(shared, p, beta_true, kappa_tar, cut_vec) {
 
 ## ========== 全域設定 ==========
 p_list <- c(3)
-n_list <- c(200)
+n_list <- c(100,200)
 r_target <- 0.5
-kappa_set <- c(0.85)
+kappa_set <- c(0.6)
 contam_rate_list <- c(0.1)
 sigma_fac_list <- c(3)
 R <- 10   
@@ -453,7 +478,10 @@ for (p in p_list) for (n_total in n_list) for (contam_rate in contam_rate_list) 
       
       ## --- EM 與 naive 都吃同一份 shared
       em_res    <- run_EM_from_shared(shared, p, beta_true, kappa_tar, cut_vec, em_diag_func = diag_all_1stepEM, verbose = FALSE)
-      naive_res <- run_naive_from_shared(shared, p, beta_true, kappa_tar, cut_vec)
+      naive_res <- run_naive_from_shared(shared, p, beta_true, kappa_tar, cut_vec, idx_use = em_res$keep)
+      message(sprintf("[check] EM keep n = %d | Naive used n = %d",
+                      length(em_res$keep),
+                      if (!is.null(naive_res)) nrow(naive_res$infl) else NA_integer_))
       message(sprintf("p=%d, n=%d, R=%d, kappa=%.2f", p, n_total, r, kappa_tar))
       list(em = em_res, naive = naive_res)
     })
@@ -500,10 +528,3 @@ print(summary_all, n = Inf, width = Inf)
 
 end_time <- Sys.time()
 cat(sprintf("\n總運行時間：%.1f 秒\n", as.numeric(difftime(end_time, start_time, units = "secs"))))
-
-out_path <- "C:/Users/kimi1/OneDrive/文件/論文/run1000.xlsx"
-sheets <- list(
-  Compare_Multi = as.data.frame(summary_all),
-  Summary_Tbl   = as.data.frame(summary_tbl)
-)
-write_xlsx(x = sheets, path = out_path)
